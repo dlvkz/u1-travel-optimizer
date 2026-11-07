@@ -22,12 +22,12 @@ import tempfile
 import time
 import traceback
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 MARKER = "; u1_travel_optimizer"
 PREHEAT_COMMENT = "; fix_preheat"
 GLUE_MM = 1.0  # patches whose original hop between them is shorter than this stay together (e.g. inner + outer wall of one spot)
-RESTORE_HOP_MM = 0.2
+DEFAULT_TRAVEL_SLOPE_DEG = 3.0  # used when the file doesn't state travel_slope
 MOVE = re.compile(r"^G[0-3](?=\s)")
 FIXED = re.compile(r"^(T\d|M104|M109|M140|M190|TEMPERATURE_WAIT|G4|M400|M220|SET_PRINT_STATS_INFO|TIMELAPSE|DEFECT|;Z:|;LAYER_CHANGE|; WIPE_TOWER)")
 BARRIER_COMMENTS = (";TYPE:Prime tower", "; WIPE_TOWER_START", "; WIPE_TOWER_END", ";LAYER_CHANGE", ";Z:", ";BEFORE_LAYER_CHANGE",
@@ -92,9 +92,9 @@ def kind(line):
 
 
 class Reorderer:
-    def __init__(self, retract, deretract):
-        self.retract = retract
-        self.deretract = deretract
+    def __init__(self, wipe, slope):
+        self.wipe = wipe  # the slicer wipes after each retract
+        self.slope = slope  # tan(travel_slope): how fast a lift rises along the travel
         self.state = dict(x=0.0, y=0.0, z=0.0, F=None, accel=None, fan=None, typ=None, obj=None)
         self.relative = False
         self.patches = 0
@@ -155,6 +155,23 @@ class Reorderer:
                 starts.append(i)
         if len(starts) < 2:
             return [line for line, _ in seg]
+        if self.wipe:
+            # With wipe on, each exit is: retract, wipe, travel. The retract and the wipe run along the patch just printed, so they stay
+            # with that patch; the next patch starts after the wipe. A progress or speed line can sit between the retract and the wipe.
+            cuts = []
+            for a in starts:
+                j = a + 1
+                while j < len(seg) and kinds[j] == "other" and not seg[j][0].strip().startswith(";WIPE_START"):
+                    j += 1
+                if j < len(seg) and seg[j][0].strip().startswith(";WIPE_START"):
+                    while j < len(seg) and not seg[j][0].strip().startswith(";WIPE_END"):
+                        j += 1
+                    cuts.append(min(j + 1, len(seg) - 1))
+                else:
+                    cuts.append(a + 1)
+            starts = cuts
+            if any(not any(k == "ext" for k in kinds[a:b]) for a, b in zip(starts, starts[1:] + [len(seg)])):
+                return [line for line, _ in seg]
         head = seg[:starts[0]]
         chunks = []
         for a, b in zip(starts, starts[1:] + [len(seg)]):
@@ -187,11 +204,13 @@ class Reorderer:
         pos = chunks[0]["prev"]
         order = []
         remaining = set(range(len(units)))
+        remaining.discard(len(units) - 1)  # the run's last patch stays last, so the run's tail follows it exactly as the slicer wrote it
         while remaining:
             k = min(remaining, key=lambda i: math.dist(pos, units[i][0]["start"]))
             order.append(k)
             remaining.discard(k)
             pos = units[k][-1]["end"]
+        order.append(len(units) - 1)
         self.runs += 1
         self.patches += len(chunks)
         self.before_mm += sum(math.dist(c["prev"], c["start"]) for c in chunks)
@@ -202,6 +221,7 @@ class Reorderer:
                 p = c["end"]
         out = [line for line, _ in head]
         cur_obj = chunks[0]["s0"]["obj"]
+        cur = chunks[0]["prev"]
         for k in order:
             for c in units[k]:
                 s0, sb = c["s0"], c["sb"]
@@ -209,7 +229,8 @@ class Reorderer:
                     out.append(s0["accel"])  # the state the patch's retract and travel originally ran with
                 for line, _ in c["trav"]:  # retracts and non-move lines (no travel, no object markers)
                     kk = kind(line)
-                    if kk == "ret" or (kk == "other" and not line.startswith("EXCLUDE_OBJECT") and line.strip() != "G17"):
+                    # the next feature's SET_VELOCITY_LIMIT goes back in after the travel, so the travel keeps the travel acceleration
+                    if kk == "ret" or (kk == "other" and not line.startswith(("EXCLUDE_OBJECT", "SET_VELOCITY_LIMIT")) and line.strip() != "G17"):
                         out.append(line)
                 if sb["obj"] != cur_obj:
                     if cur_obj:
@@ -217,12 +238,20 @@ class Reorderer:
                     if sb["obj"]:
                         out.append(f"EXCLUDE_OBJECT_START NAME={sb['obj']}")
                     cur_obj = sb["obj"]
-                lifted = c["hop"] is not None and c["hop"] > sb["z"] + 1e-6
-                if lifted:
-                    out.append(f"G1 Z{c['hop']:.10g} F30000")
-                out.append(f"G1 X{sb['x']:.3f} Y{sb['y']:.3f} F30000")
-                if lifted:
+                if c["hop"] is not None and c["hop"] > sb["z"] + 1e-6:
+                    # lift the way the slicer does: rise along the start of the travel at travel_slope, carry on at that height,
+                    # then drop straight down onto the patch
+                    d = math.dist(cur, (sb["x"], sb["y"]))
+                    rise = (c["hop"] - sb["z"]) / self.slope
+                    if d > rise:
+                        u = rise / d
+                        out.append(f"G1 X{cur[0] + (sb['x'] - cur[0]) * u:.3f} Y{cur[1] + (sb['y'] - cur[1]) * u:.3f} Z{c['hop']:.10g} F30000")
+                        out.append(f"G1 X{sb['x']:.3f} Y{sb['y']:.3f} Z{c['hop']:.10g}")
+                    else:
+                        out.append(f"G1 X{sb['x']:.3f} Y{sb['y']:.3f} Z{c['hop']:.10g} F30000")
                     out.append(f"G1 Z{sb['z']:.10g}")
+                else:
+                    out.append(f"G1 X{sb['x']:.3f} Y{sb['y']:.3f} F30000")
                 for line, _ in c["trav"]:
                     if kind(line) == "der":
                         out.append(line)
@@ -241,17 +270,15 @@ class Reorderer:
                     elif line.startswith("EXCLUDE_OBJECT_END"):
                         cur_obj = None
                     out.append(line)
-        # bring the machine to the state the original had right before the tail, then replay the tail verbatim
+                cur = c["end"]
+        # the run's last patch was printed last, so the head is already where the original run ended: restore the modal state the
+        # original had right before the tail, then replay the tail verbatim
         end_state = dict(tail[0][1]) if tail else dict(self.state)
         if cur_obj != end_state["obj"]:
             if cur_obj:
                 out.append(f"EXCLUDE_OBJECT_END NAME={cur_obj}")
             if end_state["obj"]:
                 out.append(f"EXCLUDE_OBJECT_START NAME={end_state['obj']}")
-        lx, ly = units[order[-1]][-1]["end"]
-        if math.dist((lx, ly), (end_state["x"], end_state["y"])) > 1e-3:  # put the head back where the original run ended
-            out += [self.retract, f"G1 Z{end_state['z'] + RESTORE_HOP_MM:.10g} F30000", f"G1 X{end_state['x']:.3f} Y{end_state['y']:.3f} F30000",
-                    f"G1 Z{end_state['z']:.10g}", self.deretract]
         if end_state["accel"]:
             out.append(end_state["accel"])
         if end_state["fan"]:
@@ -304,8 +331,14 @@ def check_supported(lines):
 
 def scan(lines):
     x = y = 0.0
-    z = tool = feed = active = None
+    z = tool = feed = active = zpos = None
     extrusions = collections.Counter()
+    wipes = collections.Counter()
+    restarts = collections.Counter()  # mm of filament still held back (+) or pushed out extra (-) when printing resumes
+    held = 0.0
+    e_moved = False
+    pushed = False
+    idle_pushes = 0  # filament pushed forward, then a retract or a travel instead of printing
     fixed = []
     travel = 0.0
     object_starts = 0
@@ -317,6 +350,8 @@ def scan(lines):
             z = s[3:]
         if re.match(r"^T\d", s):
             tool = s
+            held = 0.0
+            e_moved = False
         if FIXED.match(s):
             fixed.append(s)
         if s.startswith("EXCLUDE_OBJECT_START"):
@@ -340,13 +375,35 @@ def scan(lines):
                 x += p.get("X", 0.0)
                 y += p.get("Y", 0.0)
                 continue
+            zpos = p.get("Z", zpos)
             nx, ny = p.get("X", x), p.get("Y", y)
-            if p.get("E", 0) > 0 and (nx != x or ny != y):
-                extrusions[(z, tool, round(x, 3), round(y, 3), round(nx, 3), round(ny, 3), round(p["E"], 5), feed)] += 1
-            elif p.get("E", 0) == 0:
+            e = p.get("E", 0.0)
+            xy = "X" in p or "Y" in p
+            moved = xy and math.hypot(nx - x, ny - y) > 0.01  # the slicer sometimes writes a 0.001 mm nudge; that isn't a travel
+            if pushed and (e < 0 or (e == 0 and moved)):
+                idle_pushes += 1
+                pushed = False
+            elif pushed and e > 0 and xy:
+                pushed = False
+            if e > 0 and not xy:
+                pushed = True
+            if e < 0 or (e > 0 and not xy):  # retract, wipe or deretract
+                held -= e
+                e_moved = True
+            elif e > 0 and e_moved:  # first print move after them: nothing should be held back or pushed out
+                if abs(held) > 0.05:
+                    restarts[round(held, 1)] += 1
+                held = 0.0
+                e_moved = False
+            if e < 0 and xy:
+                wipes[(z, tool, round(x, 3), round(y, 3), round(nx, 3), round(ny, 3), round(e, 5))] += 1
+            if e > 0 and (nx != x or ny != y):
+                extrusions[(z, tool, round(x, 3), round(y, 3), round(nx, 3), round(ny, 3), round(e, 5), feed, zpos)] += 1
+            elif e == 0:
                 travel += math.hypot(nx - x, ny - y)
             x, y = nx, ny
-    return dict(extrusions=extrusions, fixed=fixed, travel_mm=travel, object_starts=object_starts, unbalanced=unbalanced)
+    return dict(extrusions=extrusions, wipes=wipes, restarts=restarts, idle_pushes=idle_pushes, fixed=fixed, travel_mm=travel,
+                object_starts=object_starts, unbalanced=unbalanced)
 
 
 def verify(original, result):
@@ -355,6 +412,12 @@ def verify(original, result):
         only_a = sum((a["extrusions"] - b["extrusions"]).values())
         only_b = sum((b["extrusions"] - a["extrusions"]).values())
         raise CheckFailed(f"extrusion moves differ ({only_a} only in the original, {only_b} only in the result)")
+    if a["wipes"] != b["wipes"]:
+        raise CheckFailed(f"wipe moves differ ({sum(a['wipes'].values())} in the original, {sum(b['wipes'].values())} in the result)")
+    if a["restarts"] != b["restarts"]:
+        raise CheckFailed("retract and deretract no longer balance where printing resumes")
+    if a["idle_pushes"] != b["idle_pushes"]:
+        raise CheckFailed(f"filament pushed out with nothing printed after it: {a['idle_pushes']} in the original, {b['idle_pushes']} in the result")
     if a["fixed"] != b["fixed"]:
         raise CheckFailed("tool changes, temperatures, waits or layer lines differ")
     if b["unbalanced"] > a["unbalanced"]:
@@ -364,11 +427,18 @@ def verify(original, result):
 
 def reorder(lines):
     check_supported(lines)
-    retracts = collections.Counter(line.strip() for line in lines if kind(line) == "ret")
-    deretracts = collections.Counter(line.strip() for line in lines if kind(line) == "der")
-    if not retracts or not deretracts:
+    if not any(kind(line) == "ret" for line in lines):
         return lines, "reorder: nothing to do (no retractions)"
-    worker = Reorderer(retracts.most_common(1)[0][0], deretracts.most_common(1)[0][0])
+    wipe = any(line.startswith(";WIPE_START") for line in lines)
+    slope_deg = DEFAULT_TRAVEL_SLOPE_DEG
+    for line in reversed(lines):
+        if line.startswith("; travel_slope = "):
+            try:
+                slope_deg = float(line.split("=", 1)[1].split(",")[0])
+            except ValueError:
+                pass
+            break
+    worker = Reorderer(wipe, math.tan(math.radians(max(slope_deg, 0.5))))
     result = worker.run(lines)
     if worker.patches == 0:
         return lines, "reorder: nothing to do"

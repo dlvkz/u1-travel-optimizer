@@ -1,5 +1,6 @@
 """python -m unittest discover -s tests"""
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,67 @@ def sweeping_gcode():
     for i in range(6):
         lines += patch(10 if i % 2 == 0 else 250, 10 + i * 10)
     return lines + ["G1 E-1 F6000", ";LAYER_CHANGE", ";Z:0.4"] + CONFIG
+
+
+def wiped_gcode():
+    """The same sweep as the slicer writes it with wipe on (the U1 default): travel acceleration, retract, wipe back along the patch,
+    a lift that rises during the travel, deretract, then the feature's own acceleration."""
+    lines = ["M83", "T0", ";LAYER_CHANGE", ";Z:0.2", "G1 X10 Y10 F30000", "G1 E1.5 F1800"]
+    end = (10, 10)
+    for i in range(6):
+        x, y = (10 if i % 2 == 0 else 250), 10 + i * 10
+        if i:
+            lines += ["SET_VELOCITY_LIMIT ACCEL=6000 ACCEL_TO_DECEL=3000", "G1 E-1.1 F1800", ";WIPE_START", "G1 F9000",
+                      f"G1 X{end[0] + 1} Y{end[1]} E-.4", ";WIPE_END", f"G1 X{x} Y{y} Z0.6 F30000", "G1 Z0.2", "G1 E1.5 F1800"]
+        lines += ["SET_VELOCITY_LIMIT ACCEL=2000 ACCEL_TO_DECEL=1000", ";TYPE:Outer wall", "G1 F3600",
+                  f"G1 X{x + 2} Y{y} E.1", f"G1 X{x + 2} Y{y + 2} E.1", f"G1 X{x} Y{y + 2} E.1"]
+        end = (x, y + 2)
+    return lines + ["G1 E-1.5 F1800", ";LAYER_CHANGE", ";Z:0.4", "; travel_slope = 3"] + CONFIG
+
+
+class WipeTests(unittest.TestCase):
+    """Fixes in 1.1.0, found on real prints with the U1's default settings (wipe on)."""
+
+    def test_wipes_and_retracts_stay_balanced(self):
+        lines = wiped_gcode()
+        result, messages = opt.process(lines, do_preheat=False)
+        self.assertIsNot(result, lines, messages)
+        a, b = opt.scan(lines), opt.scan(result)
+        self.assertLess(b["travel_mm"], a["travel_mm"] * 0.6)
+        self.assertEqual(a["wipes"], b["wipes"])
+        self.assertEqual(a["restarts"], b["restarts"])
+        self.assertEqual(a["idle_pushes"], b["idle_pushes"])
+
+    def test_travel_keeps_the_travel_acceleration(self):
+        result, _ = opt.process(wiped_gcode(), do_preheat=False)
+        accel = None
+        for line in result:
+            if line.startswith("SET_VELOCITY_LIMIT"):
+                accel = line
+            elif accel and line.startswith("G1 X") and "F30000" in line and " E" not in line:  # every travel after the first patch
+                self.assertIn("ACCEL=6000", accel, line)
+
+    def test_lifts_rise_along_the_travel(self):
+        result, _ = opt.process(sweeping_gcode(), do_preheat=False)
+        self.assertFalse([line for line in result if re.match(r"^G1 Z[\d.]+ F30000$", line)])  # no separate straight-up hop
+        self.assertTrue([line for line in result if re.match(r"^G1 X[\d.]+ Y[\d.]+ Z[\d.]+ F30000$", line)])
+
+    def test_no_extra_priming_at_the_end_of_a_run(self):
+        lines = sweeping_gcode()
+        result, _ = opt.process(lines, do_preheat=False)
+        self.assertEqual(sum(opt.kind(line) == "der" for line in lines), sum(opt.kind(line) == "der" for line in result))
+
+    def test_verify_catches_a_lost_wipe(self):
+        lines = wiped_gcode()
+        wipe = next(line for line in lines if line.endswith("E-.4"))
+        with self.assertRaises(opt.CheckFailed):
+            opt.verify(lines, [line for line in lines if line != wipe])
+
+    def test_verify_catches_filament_pushed_out_with_nothing_printed(self):
+        lines = wiped_gcode()
+        i = lines.index("G1 X12 Y10 E.1") + 1
+        with self.assertRaises(opt.CheckFailed):
+            opt.verify(lines, lines[:i] + ["G1 E1", "G1 E-1"] + lines[i:])  # no speed change, so only this check can catch it
 
 
 class ReorderTests(unittest.TestCase):

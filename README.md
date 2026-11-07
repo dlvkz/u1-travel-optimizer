@@ -6,16 +6,27 @@ With mixed filaments, the slicer prints each layer's patches one mixed filament 
 
 | Test print | Patches moved | Extrusion moves verified | Travel before | Travel after |
 |---|---|---:|---:|---:|
-| Large mixed-colour relief at 0.1 mm (2x convex mirror) | 327,904 | 3,658,942 | 13.9 km | 3.45 km |
+| Large mixed-colour relief at 0.1 mm (2x convex mirror) | 324,844 | 3,647,442 | 14.8 km | 3.39 km |
 | Mixed-colour plate at 0.2 mm, exported from Snapmaker Orca 2.4.1 | 1,417 | 155,877 | 163.0 m | 149.6 m |
 
 The gain depends on how many separate patches a layer has, so simple prints gain little.
 
-The mirror was printed start to finish on a U1 with an earlier version of this script, in 39.6 hours of printing. The same file wasn't printed without reordering, so the time saved hasn't been measured.
+The mirror was printed start to finish on a U1 with an earlier version of this script, in 39.6 hours of printing. The same file wasn't printed without reordering, so the time saved hasn't been measured. Version 1.1.0 hasn't been used for a full print yet.
 
 It also adds a guard before each tool change, so a head that is still cold can't be picked. That stops the "extruder below minimum temp" abort on tiny first layers.
 
 This is a post-processing script, not a plugin. The slicer runs it on the G-code after slicing, and there's no button or menu for it.
+
+## Update to 1.1.0 if you use wipe
+
+Version 1.0.0 had bugs that show up with the U1's default retraction settings, where **Wipe while retracting** is on. Found on real prints and fixed in 1.1.0:
+
+- **Wipe moves were dropped.** Part of each retract happens during the wipe, so after a moved patch up to about 1 mm of extra filament was pushed out where printing resumed (blobs and zits).
+- **Filament was pushed out with nothing printed.** At the end of each reordered run the head went back to where the original run ended and primed there. That left strings, small dots and thin columns next to the print.
+- **Lifts were separate straight up and down moves.** They now rise along the travel at the profile's travel slope, as the slicer's own lifts do, which is faster.
+- **Travels used the next feature's acceleration**, usually the slower wall value. They now keep the travel acceleration.
+
+The safety check of 1.0.0 compared only the printing moves, so it didn't catch the first two. It now also compares every wipe move, the retract balance at each restart, the filament pushed out with nothing printed after it, and the height of every printing move.
 
 ## Install
 
@@ -52,7 +63,10 @@ python u1_travel_optimizer.py plate_1.gcode --output plate_1_optimized.gcode
 
 Before anything is written, the result is compared with the original:
 
-- every extrusion move must match, by layer, tool, start, end, amount and speed
+- every extrusion move must match, by layer, tool, start, end, height, amount and speed
+- every wipe move must match
+- where printing resumes, the filament held back by retracts and wipes must be the same as in the original
+- the places where filament is pushed out with nothing printed after it must match the original
 - every tool change, temperature, wait and layer line must match, in the same order
 - object markers must stay balanced
 
@@ -72,7 +86,7 @@ The last run's result is in `%LOCALAPPDATA%\U1TravelOptimizer\last_run.log`.
 - The slicer's time estimate and preview still show the original order.
 - Files get bigger, 3% to about 20% on the test prints, because each moved patch restores its own settings.
 - Very large files take minutes (about 3 minutes for a 200 MB file).
-- Z hops between moved patches become straight lifts instead of spirals.
+- Lifts between moved patches rise along the travel like the slicer's, but spiral lifts become straight sloped ones.
 - Only tested on the Snapmaker U1 with relative extrusion, on a few Full Spectrum models so far.
 - Running it from the slicer has only been tested on Windows, with Snapmaker Orca 2.4.1. The macOS and Linux setup hasn't been tested.
 
