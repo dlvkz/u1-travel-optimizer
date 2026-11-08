@@ -11,7 +11,7 @@ With mixed filaments, the slicer prints each layer's patches one mixed filament 
 
 The gain depends on how many separate patches a layer has, so simple prints gain little.
 
-The mirror was printed start to finish on a U1 with an earlier version of this script, in 39.6 hours of printing. The same file wasn't printed without reordering, so the time saved hasn't been measured. Version 1.1.0 hasn't been used for a full print yet.
+The mirror was printed start to finish on a U1 with an earlier version of this script, in 39.6 hours of printing. The same file wasn't printed without reordering, so the time saved hasn't been measured. Versions 1.1.0 and 1.1.1 haven't been used for a full print yet.
 
 It also adds a guard before each tool change, so a head that is still cold can't be picked. That stops the "extruder below minimum temp" abort on tiny first layers.
 
@@ -27,6 +27,8 @@ Version 1.0.0 had bugs that show up with the U1's default retraction settings, w
 - **Travels used the next feature's acceleration**, usually the slower wall value. They now keep the travel acceleration.
 
 The safety check of 1.0.0 compared only the printing moves, so it didn't catch the first two. It now also compares every wipe move, the retract balance at each restart, the filament pushed out with nothing printed after it, and the height of every printing move.
+
+1.1.1 fixes a safety check in 1.1.0 that was too strict. 1.1.0 discarded the reorder on some files, which then kept the slicer's travel order. The slicer sometimes deretracts for a patch that turns out to be empty and then travels on. The reorder drops that deretract, and 1.1.0 refused any change in how many of these there were, even fewer. 1.1.1 accepts fewer, but still refuses one in a place where the original doesn't have one.
 
 ## Install
 
@@ -66,7 +68,7 @@ Before anything is written, the result is compared with the original:
 - every extrusion move must match, by layer, tool, start, end, height, amount and speed
 - every wipe move must match
 - where printing resumes, the filament held back by retracts and wipes must be the same as in the original
-- the places where filament is pushed out with nothing printed after it must match the original
+- filament may be pushed out with nothing printed after it only where the original already does that (the slicer sometimes deretracts for a patch that turns out empty; the reorder may leave those out, but never adds one in a new place)
 - every tool change, temperature, wait and layer line must match, in the same order
 - object markers must stay balanced
 

@@ -85,6 +85,22 @@ class WipeTests(unittest.TestCase):
         with self.assertRaises(opt.CheckFailed):
             opt.verify(lines, lines[:i] + ["G1 E1", "G1 E-1"] + lines[i:])  # no speed change, so only this check can catch it
 
+    def test_dropping_the_slicers_own_idle_push_is_accepted(self):
+        """The slicer deretracts for a patch that turns out empty, then travels on; a result without that push is fine."""
+        lines = wiped_gcode()
+        i = lines.index("G1 X12 Y10 E.1") + 1
+        a, b = opt.verify(lines[:i] + ["G1 E1", "G1 E-1"] + lines[i:], lines)
+        self.assertEqual(sum(a["idle_pushes"].values()), 1)
+        self.assertFalse(b["idle_pushes"])
+
+    def test_verify_catches_an_idle_push_moved_to_a_new_spot(self):
+        """Same count, different place: one lost and one new must still be refused."""
+        lines = wiped_gcode()
+        i = lines.index("G1 X12 Y10 E.1") + 1
+        j = lines.index("G1 X12 Y12 E.1") + 1
+        with self.assertRaises(opt.CheckFailed):
+            opt.verify(lines[:i] + ["G1 E1", "G1 E-1"] + lines[i:], lines[:j] + ["G1 E1", "G1 E-1"] + lines[j:])
+
 
 class ReorderTests(unittest.TestCase):
     def test_cuts_travel_and_keeps_every_extrusion(self):

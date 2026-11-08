@@ -22,7 +22,7 @@ import tempfile
 import time
 import traceback
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 MARKER = "; u1_travel_optimizer"
 PREHEAT_COMMENT = "; fix_preheat"
@@ -337,8 +337,8 @@ def scan(lines):
     restarts = collections.Counter()  # mm of filament still held back (+) or pushed out extra (-) when printing resumes
     held = 0.0
     e_moved = False
-    pushed = False
-    idle_pushes = 0  # filament pushed forward, then a retract or a travel instead of printing
+    pushed = None  # where filament was last pushed forward, until printing starts
+    idle_pushes = collections.Counter()  # spots where filament was pushed forward, then a retract or a travel instead of printing
     fixed = []
     travel = 0.0
     object_starts = 0
@@ -381,12 +381,12 @@ def scan(lines):
             xy = "X" in p or "Y" in p
             moved = xy and math.hypot(nx - x, ny - y) > 0.01  # the slicer sometimes writes a 0.001 mm nudge; that isn't a travel
             if pushed and (e < 0 or (e == 0 and moved)):
-                idle_pushes += 1
-                pushed = False
+                idle_pushes[pushed] += 1
+                pushed = None
             elif pushed and e > 0 and xy:
-                pushed = False
+                pushed = None
             if e > 0 and not xy:
-                pushed = True
+                pushed = (z, tool, round(x, 3), round(y, 3))
             if e < 0 or (e > 0 and not xy):  # retract, wipe or deretract
                 held -= e
                 e_moved = True
@@ -416,8 +416,12 @@ def verify(original, result):
         raise CheckFailed(f"wipe moves differ ({sum(a['wipes'].values())} in the original, {sum(b['wipes'].values())} in the result)")
     if a["restarts"] != b["restarts"]:
         raise CheckFailed("retract and deretract no longer balance where printing resumes")
-    if a["idle_pushes"] != b["idle_pushes"]:
-        raise CheckFailed(f"filament pushed out with nothing printed after it: {a['idle_pushes']} in the original, {b['idle_pushes']} in the result")
+    # The slicer sometimes deretracts for a patch that turns out empty, then travels on; the reorder can drop those. Fewer is fine,
+    # but every one left in the result must be one the original already had at the same spot.
+    new = b["idle_pushes"] - a["idle_pushes"]
+    if new:
+        raise CheckFailed(f"filament pushed out with nothing printed after it at {sum(new.values())} spot(s) the original doesn't have "
+                          f"({sum(a['idle_pushes'].values())} in the original, {sum(b['idle_pushes'].values())} in the result)")
     if a["fixed"] != b["fixed"]:
         raise CheckFailed("tool changes, temperatures, waits or layer lines differ")
     if b["unbalanced"] > a["unbalanced"]:
@@ -445,8 +449,10 @@ def reorder(lines):
     a, b = verify(lines, result)
     if b["travel_mm"] >= a["travel_mm"]:
         return lines, f"reorder: kept the original order (travel wouldn't drop: {a['travel_mm'] / 1000:.2f} m -> {b['travel_mm'] / 1000:.2f} m)"
+    dropped = sum((a["idle_pushes"] - b["idle_pushes"]).values())
     return result, (f"reorder: {worker.patches} patches in {worker.runs} runs; {sum(a['extrusions'].values())} extrusion moves verified; "
-                    f"total travel {a['travel_mm'] / 1000:.1f} m -> {b['travel_mm'] / 1000:.1f} m")
+                    f"total travel {a['travel_mm'] / 1000:.1f} m -> {b['travel_mm'] / 1000:.1f} m"
+                    + (f"; {dropped} idle deretract(s) on empty patches left out" if dropped else ""))
 
 
 def guard_cold_tool_changes(lines):
